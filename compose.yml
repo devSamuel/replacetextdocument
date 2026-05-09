@@ -1,0 +1,346 @@
+services:  
+  producer:
+    image: my-producer:latest
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=broker1:9092,broker2:9092,broker3:9092,broker4:9092
+      - TOPIC_NEW_ORDERS=incoming-orders
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    sysctls:
+      - net.core.somaxconn=32768        # Tamaño de la cola de sockets del kernel
+      - net.ipv4.tcp_max_syn_backlog=32768
+      - net.ipv4.ip_local_port_range=1024 65535
+    networks:
+      - kafka-net
+      - app_net
+      - redis-net
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      replicas: 1
+      endpoint_mode: dnsrr # <--- CAMBIO CRÍTICO
+      restart_policy:
+        condition: on-failure
+      update_config:
+        parallelism: 1
+        delay: 10s
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: orders_db
+      POSTGRES_USER: orders_user
+      POSTGRES_PASSWORD: orders_pass
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - app-postgres-net
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+
+  consumer:
+    image: my-consumer:latest
+    environment:
+      - TOPIC_NEW_ORDERS=incoming-orders
+      - TOPIC_CONFIRMED_ORDERS=confirmed-orders
+      - KAFKA_BOOTSTRAP_SERVERS=broker1:9092,broker2:9092,broker3:9092,broker4:9092
+      - POSTGRES_DSN=postgresql://orders_user:orders_pass@postgres:5432/orders_db
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+    networks:
+      - kafka-net
+      - redis-net
+      - app-postgres-net
+  # OLD nginx service - REMOVED to avoid port conflict with nginx-1
+  # Use nginx-1, nginx-2, nginx-3 instead for multi-nginx architecture
+
+  # Nginx Instance 1 - Port 80
+  nginx-1:
+    image: nginx:latest
+    hostname: nginx-1
+    ports:
+      - target: 80
+        published: 80
+        protocol: tcp
+        mode: host
+    networks:
+      - app_net
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/logs/nginx-1:/var/log/nginx
+    sysctls:
+      - net.core.somaxconn=32768
+      - net.ipv4.tcp_max_syn_backlog=32768
+      - net.ipv4.ip_local_port_range=1024 65535
+      - net.ipv4.tcp_fin_timeout=15
+      - net.ipv4.tcp_tw_reuse=1
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+
+ # --- Controllers ---
+  kafka-controller:
+    image: bitnamilegacy/kafka:latest
+    hostname: kafka-controller-{{.Task.Slot}}
+    deploy:
+      resources:
+        limits:
+          cpus: '3.5'            # Limit to 1.5 CPU cores
+          memory: 6G          # Limit to 3GB of RAM
+        reservations:
+          cpus: '0.5'            # Reserve 0.5 CPU cores (guaranteed)
+          memory: 1024M          # Reserve 1GB of RAM (guaranteed)
+      mode: replicated
+      
+      replicas: 3
+      placement:
+        constraints:
+          # Ensure controllers deploy to specific nodes if needed, e.g., 'node.labels.kafka-role == controller'
+          # For a general swarm, simply ensuring unique hosts can be sufficient:
+          - "node.id != an_invalid_id" # A placeholder constraint
+    environment:
+      # KRaft Settings
+      - BITNAMI_DEBUG=true
+      - KAFKA_CFG_NODE_ID={{.Task.Slot}}
+      - KAFKA_CFG_PROCESS_ROLES=controller
+      - KAFKA_KRAFT_CLUSTER_ID=HacAgFbaRJ6PuDyphbLNFA
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka-controller-1:9093,2@kafka-controller-2:9093,3@kafka-controller-3:9093
+
+      # Listener Configuration
+      # - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka-controller-{{.Task.Slot}}:9092
+    # FIX: Only include the CONTROLLER listener here
+      - KAFKA_CFG_LISTENERS=CONTROLLER://:9093
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      
+      # Keep the map as is to satisfy the script requirements
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT
+      # Data persistence (customize host path)
+      - KAFKA_CFG_LOG_DIRS=/bitnami/kafka/data/{{.Task.Slot}}
+      - KAFKA_HEAP_OPTS=${BROKER_HEAP_OPTS}
+    volumes:
+      # Use named volumes for data persistence in swarm
+      - ./kafka/kafka-data/controller-{{.Task.Slot}}:/bitnami/kafka/data/{{.Task.Slot}}
+    networks:
+      - kafka-net
+
+    # --- Broker 4 (Individual Service 1/3) ---
+  broker4:
+    image: bitnamilegacy/kafka:latest
+    hostname: broker4
+    ports:
+      - "9097:9092"
+    environment:
+      - KAFKA_CFG_NODE_ID=7 # Hardcoded ID
+      - KAFKA_CFG_PROCESS_ROLES=broker
+      - KAFKA_KRAFT_CLUSTER_ID=HacAgFbaRJ6PuDyphbLNFA
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka-controller-1:9093,2@kafka-controller-2:9093,3@kafka-controller-3:9093
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://broker4:9092 # Hardcoded Hostname
+      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      - KAFKA_CFG_LOG_DIRS=/bitnami/kafka/data
+      - KAFKA_HEAP_OPTS=${BROKER_HEAP_OPTS}
+    volumes:
+      - ./kafka/kafka-data/broker4:/bitnami/kafka/data
+    networks:
+      - kafka-net
+    deploy:
+      resources:
+        limits:
+          cpus: '3.5'            # Limit to 1.5 CPU cores
+          memory: 6G          # Limit to 3GB of RAM
+        reservations:
+          cpus: '0.5'            # Reserve 0.5 CPU cores (guaranteed)
+          memory: 1024M          # Reserve 1GB of RAM (guaranteed)
+
+
+  # --- Broker 3 (Individual Service 2/3) ---
+  broker3:
+    image: bitnamilegacy/kafka:latest
+    hostname: broker3
+    ports:
+      - "9094:9092"
+    environment:
+      - KAFKA_CFG_NODE_ID=4 # Hardcoded ID
+      - KAFKA_CFG_PROCESS_ROLES=broker
+      - KAFKA_KRAFT_CLUSTER_ID=HacAgFbaRJ6PuDyphbLNFA
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka-controller-1:9093,2@kafka-controller-2:9093,3@kafka-controller-3:9093
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://broker3:9092 # Hardcoded Hostname
+      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      - KAFKA_CFG_LOG_DIRS=/bitnami/kafka/data
+      - KAFKA_HEAP_OPTS=${BROKER_HEAP_OPTS}
+    volumes:
+      - ./kafka/kafka-data/broker3:/bitnami/kafka/data
+    networks:
+      - kafka-net
+    deploy:
+      resources:
+        limits:
+          cpus: '4.5'            # Limit to 1.5 CPU cores
+          memory: 6G          # Limit to 3GB of RAM
+        reservations:
+          cpus: '0.5'            # Reserve 0.5 CPU cores (guaranteed)
+          memory: 1024M          # Reserve 1GB of RAM (guaranteed)
+
+  # --- Broker 2 (Individual Service 3/3) ---
+  broker2:
+    image: bitnamilegacy/kafka:latest
+    hostname: broker2
+    ports:
+      - "9095:9092"
+    environment:
+      - KAFKA_CFG_NODE_ID=5 # Hardcoded ID
+      - KAFKA_CFG_PROCESS_ROLES=broker
+      - KAFKA_KRAFT_CLUSTER_ID=HacAgFbaRJ6PuDyphbLNFA
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka-controller-1:9093,2@kafka-controller-2:9093,3@kafka-controller-3:9093
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://broker2:9092
+      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      - KAFKA_CFG_LOG_DIRS=/bitnami/kafka/data
+      - KAFKA_HEAP_OPTS=${BROKER_HEAP_OPTS}
+    volumes:
+      - ./kafka/kafka-data/broker2:/bitnami/kafka/data
+    networks:
+      - kafka-net
+    deploy:
+      resources:
+        limits:
+          cpus: '4.5'            # Limit to 1.5 CPU cores
+          memory: 6G          # Limit to 3GB of RAM
+        reservations:
+          cpus: '0.5'            # Reserve 0.5 CPU cores (guaranteed)
+          memory: 1024M          # Reserve 1GB of RAM (guaranteed)
+  # --- Broker 6 (Individual Service 3/3) ---
+  broker1:
+    image: bitnamilegacy/kafka:latest
+    hostname: broker1
+    ports:
+      - "9096:9092"
+    environment:
+      - KAFKA_CFG_NODE_ID=6 # Hardcoded ID
+      - KAFKA_CFG_PROCESS_ROLES=broker
+      - KAFKA_KRAFT_CLUSTER_ID=HacAgFbaRJ6PuDyphbLNFA
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka-controller-1:9093,2@kafka-controller-2:9093,3@kafka-controller-3:9093
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://broker1:9092
+      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      - KAFKA_CFG_LOG_DIRS=/bitnami/kafka/data
+      - KAFKA_HEAP_OPTS=${BROKER_HEAP_OPTS}
+    volumes:
+      - ./kafka/kafka-data/broker1:/bitnami/kafka/data
+    networks:
+      - kafka-net
+    deploy:
+      resources:
+        limits:
+          cpus: '4.5'           # Limit to 1.5 CPU cores
+          memory: 6G          # Limit to 3GB of RAM
+        reservations:
+          cpus: '0.5'            # Reserve 0.5 CPU cores (guaranteed)
+          memory: 1024M          # Reserve 1GB of RAM (guaranteed)
+  # ============================================================================
+  # MONITORING UI (Proven tool for management)
+  # ============================================================================
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_S_0_NAME: ProdKRaft23
+      DYNAMIC_CONFIG_ENABLED: 'true'
+      KAFKA_CLUSTERS_0_NAME: local-cluster
+      # Connect to BROKERS (internal port), not Controllers
+      KAFKA_S_0_BOOTSTRAPSERVERS: 'broker1:9092,broker2:9092,broker3:9092'
+    networks:
+      - kafka-net
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    networks:
+      - redis-net
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+
+  topic-creator:
+    image: bitnamilegacy/kafka:latest
+    deploy:
+      restart_policy:
+        condition: on-failure
+        max_attempts: 10
+    entrypoint: ["/bin/sh", "-c", "echo 'Waiting for ...'; /usr/local/bin/create_topics.sh"]
+    configs:
+      - source: create_topics_script
+        target: /usr/local/bin/create_topics.sh
+        mode: 0555
+    networks:
+      - kafka-net
+networks:
+  kafka-net:
+    driver: overlay
+    attachable: true
+  redis-net:
+    driver: overlay
+    attachable: true
+  app-postgres-net:
+    driver: overlay
+    attachable: true
+  app_net:
+    driver: overlay
+    attachable: true # Allows Nginx to see the Producers more easily
+    ipam:
+      config:
+        - subnet: 172.28.0.0/26 # Un rango que no choque con tu LAN
+    driver_opts:
+      com.docker.network.driver.mtu: 1400 # <--- ADD THIS HERE
+
+volumes:
+  controller-data-1:
+  controller-data-2:
+  controller-data-3:
+  broker-data-4:
+  broker-data-5:
+  broker-data-6:
+  broker-data-7:
+  redis-data:
+
+configs:
+  nginx_conf:
+    file: ./nginx/nginx.conf
+  create_topics_script:
+    file: ./kafka/create_topics.sh
+# docker node update --label-add kafka.c1=controller1 < 
+#docker node update --label-add kafka.c1=controller1 --label-add kafka.c2=controller2 --label-add kafka.c3=controller3 --label-add  kafka.idq1=broker1 --label-add  kafka.idq2=broker2 --label-add kafka.idq3=broker3 my-laptop-node
+# 8.4.2.1
+# 172.28.0.1, 172.28.0.2
+# 172.28.0.8/29

@@ -1,0 +1,182 @@
+# compose.dev.yml — dev-only single-node stack
+# Requires Docker Compose v2.20+
+
+services:
+  kafka:
+    image: apache/kafka:4.1.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_LOG_SEGMENT_BYTES: 536870912    # 512 MB segments
+      KAFKA_MESSAGE_MAX_BYTES: 10485760     # 10 MB — covers large PDFs
+      KAFKA_REPLICA_FETCH_MAX_BYTES: 10485760
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - kafka-net
+    healthcheck:
+      test: >
+        /opt/kafka/bin/kafka-topics.sh
+        --bootstrap-server localhost:9092
+        --list > /dev/null 2>&1
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: on-failure
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+
+  redis:
+    image: redis:7-alpine
+    # Disable all persistence (pure cache) — eliminates BGSAVE latency spikes
+    # allkeys-lru evicts old results gracefully instead of erroring on OOM
+    command: >
+      redis-server
+      --save ""
+      --appendonly no
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    networks:
+      - redis-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: on-failure
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 320M
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: orders_db
+      POSTGRES_USER: orders_user
+      POSTGRES_PASSWORD: orders_pass
+    # synchronous_commit=off safe here: Redis holds authoritative results,
+    # Postgres is audit-only — removes WAL fsync from consumer critical path
+    command: >
+      postgres
+      -c shared_buffers=64MB
+      -c work_mem=4MB
+      -c maintenance_work_mem=32MB
+      -c effective_cache_size=192MB
+      -c synchronous_commit=off
+      -c wal_buffers=8MB
+      -c checkpoint_completion_target=0.9
+      -c log_min_duration_statement=500
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - app-postgres-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orders_user -d orders_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: on-failure
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 320M
+
+  producer:
+    build: ./producer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      TOPIC_NEW_ORDERS: incoming-orders
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      PORT: 3000
+      KAFKAJS_NO_PARTITIONER_WARNING: "1"
+      NODE_ENV: development
+    ports:
+      - "3000:3000"
+    networks:
+      - kafka-net
+      - redis-net
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  consumer:
+    build: ./consumer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      TOPIC_NEW_ORDERS: incoming-orders
+      TOPIC_CONFIRMED_ORDERS: confirmed-orders
+      POSTGRES_DSN: postgresql://orders_user:orders_pass@postgres:5432/orders_db
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      KAFKAJS_NO_PARTITIONER_WARNING: "1"
+      NODE_ENV: development
+    networks:
+      - kafka-net
+      - redis-net
+      - app-postgres-net
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: on-failure
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 512M
+
+networks:
+  kafka-net:
+    driver: bridge
+  redis-net:
+    driver: bridge
+  app-postgres-net:
+    driver: bridge
+
+volumes:
+  kafka-data:
+  postgres-data:
