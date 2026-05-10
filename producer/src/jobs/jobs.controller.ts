@@ -6,7 +6,6 @@ import {
   Query,
   Req,
   Res,
-  Body,
   BadRequestException,
   ServiceUnavailableException,
 } from '@nestjs/common';
@@ -17,11 +16,6 @@ import { KafkaService } from '../kafka/kafka.service';
 import { streamToBuffer } from '../streaming/utils';
 
 const BODY_LIMIT = 50 * 1024 * 1024;
-
-interface JsonUnredactBody {
-  key?: string;
-  text?: string;
-}
 
 @Controller()
 export class JobsController {
@@ -48,28 +42,20 @@ export class JobsController {
   }
 
   @Post('unredact')
-  async unredact(
-    @Req() req: FastifyRequest,
-    @Body() body: JsonUnredactBody,
-  ): Promise<{ jobId: string }> {
-    const ct = (req.headers['content-type'] ?? '').split(';')[0].trim();
-    if (ct === 'application/octet-stream') {
-      const key = req.headers['x-key'] as string | undefined;
-      if (!key) throw new BadRequestException('X-Key header is required');
-      const stream = req.body as NodeJS.ReadableStream;
-      const buf = await streamToBuffer(stream, Buffer.alloc(0), BODY_LIMIT);
-      let text: string;
-      try {
-        text = await this.extractor.extractText(buf);
-      } catch (err: unknown) {
-        throw new BadRequestException(
-          'Failed to parse document: ' + (err instanceof Error ? err.message : String(err)),
-        );
-      }
-      return this.jobs.unredact(buf, key, text);
+  async unredact(@Req() req: FastifyRequest): Promise<{ jobId: string }> {
+    const key = req.headers['x-key'] as string | undefined;
+    if (!key) throw new BadRequestException('X-Key header is required');
+    const stream = req.body as NodeJS.ReadableStream;
+    const buf = await streamToBuffer(stream, Buffer.alloc(0), BODY_LIMIT);
+    let text: string;
+    try {
+      text = await this.extractor.extractText(buf);
+    } catch (err: unknown) {
+      throw new BadRequestException(
+        'Failed to parse document: ' + (err instanceof Error ? err.message : String(err)),
+      );
     }
-    if (!body?.key || !body?.text) throw new BadRequestException('key and text are required');
-    return this.jobs.unredact(null, body.key, body.text);
+    return this.jobs.unredact(buf, key, text);
   }
 
   @Get('result/:jobId')
