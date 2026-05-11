@@ -95,10 +95,9 @@ Supports plain text, PDF, DOCX, ODT, and RTF. Handles files up to 200 MB without
 
 ```
 1. POST /unredact
-   JSON body: { "key": "<original-jobId>", "text": "Hello XXXX" }
-   — or —
-   Headers: Content-Type: application/octet-stream, X-Key: <original-jobId>
-   Body: redacted document file
+   Headers: Content-Type: application/octet-stream
+            X-Key: <original-jobId>
+   Body: redacted document (plain text, PDF, DOCX, ODT, or RTF)
 
 2. Producer publishes:
    { type: "unredact", jobId, text, key }
@@ -184,12 +183,7 @@ curl "http://localhost:3000/result/$JOB?format=txt" -o redacted.txt
 # Download in original format
 curl "http://localhost:3000/result/$JOB?format=original" -o redacted_original
 
-# Unredact (JSON)
-curl -X POST http://localhost:3000/unredact \
-  -H "Content-Type: application/json" \
-  -d "{\"key\":\"$JOB\", \"text\":\"Hello XXXX\"}"
-
-# Unredact a file
+# Unredact (plain text or any supported file format)
 UNJOB=$(curl -s -X POST http://localhost:3000/unredact \
   -H "Content-Type: application/octet-stream" \
   -H "X-Key: $JOB" \
@@ -255,17 +249,12 @@ Download the result as a file.
 
 Restore original text from a redacted document.
 
-**JSON body:**
-```json
-{ "key": "<original-jobId>", "text": "Hello XXXX world" }
-```
+| Header | Required | Description |
+|---|---|---|
+| `Content-Type` | yes | `application/octet-stream` |
+| `X-Key` | yes | The `jobId` returned by the original `/redact` call |
 
-**File body:**
-```
-Content-Type: application/octet-stream
-X-Key: <original-jobId>
-Body: redacted document file
-```
+Body: the redacted document — plain text, PDF, DOCX, ODT, or RTF.
 
 **Response:** `{ "jobId": "uuid" }`
 
